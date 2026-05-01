@@ -36,14 +36,36 @@ from django.db.models.functions import Cast, Rank, Replace
 from healthdatamodel.constants import ConnectionStatus, DataSource
 from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
 
-_SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
-_SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
-
-# Preference order when a customer has no explicit preferred-sleep device set
 _DEFAULT_SLEEP_DEVICE_SORT_ORDER = ["oura", "whoop", "apple", "garmin"]
 
 
+class SleepValue(StrEnum):
+    """HKCategoryValueSleepAnalysis* strings used as Record.value for sleep intervals.
+
+    Use these on both the insert and query side so the strings stay in sync.
+    ``ASLEEP_*`` variants are counted as sleep; ``AWAKE`` and ``IN_BED`` are not.
+    """
+
+    ASLEEP_UNSPECIFIED = "HKCategoryValueSleepAnalysisAsleepUnspecified"
+    ASLEEP_CORE = "HKCategoryValueSleepAnalysisAsleepCore"
+    ASLEEP_DEEP = "HKCategoryValueSleepAnalysisAsleepDeep"
+    ASLEEP_REM = "HKCategoryValueSleepAnalysisAsleepREM"
+    AWAKE = "HKCategoryValueSleepAnalysisAwake"
+    IN_BED = "HKCategoryValueSleepAnalysisInBed"
+
+
+SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
+
+_SLEEP_TYPE = SLEEP_TYPE
+_SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
+
+
 class ActivityMetric(StrEnum):
+    """HK type strings used as Record.type for activity metrics.
+
+    Use these on both the insert and query side so the strings stay in sync.
+    """
+
     ACTIVE_CALORIES = "HKQuantityTypeIdentifierActiveEnergyBurned"
     BASAL_CALORIES = "HKQuantityTypeIdentifierBasalEnergyBurned"
     STEPS = "HKQuantityTypeIdentifierStepCount"
