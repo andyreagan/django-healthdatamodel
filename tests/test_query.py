@@ -16,7 +16,15 @@ from django.contrib.auth import get_user_model
 
 from healthdatamodel.constants import DataSource
 from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
-from healthdatamodel.query import ActivityMetric, get_activity_by_day, get_sleep_hours_by_day
+from healthdatamodel.query import (
+    ActivityMetric,
+    DailySleep,
+    ensure_ranks,
+    get_activity_by_day,
+    get_activity_records,
+    get_sleep_by_day,
+    get_sleep_hours_by_day,
+)
 
 User = get_user_model()
 
@@ -322,11 +330,115 @@ class TestSleepHoursMultiDevice:
 
 
 # ---------------------------------------------------------------------------
-# get_activity_by_day — skipped (requires PostgreSQL)
+# get_sleep_by_day — wake_time
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="get_activity_by_day requires PostgreSQL; tested via consuming project")
+class TestSleepByDay:
+    def test_returns_daily_sleep_namedtuple(self, customer):
+        result = get_sleep_by_day(customer, TODAY, TODAY)
+        assert isinstance(result[TODAY], DailySleep)
+
+    def test_no_records_both_none(self, customer):
+        result = get_sleep_by_day(customer, TODAY, TODAY)
+        assert result[TODAY].hours is None
+        assert result[TODAY].wake_time is None
+
+    def test_hours_matches_get_sleep_hours_by_day(self, customer):
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].hours == pytest.approx(8.0)
+        assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == pytest.approx(8.0)
+
+    def test_wake_time_is_last_record_end(self, customer):
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        expected_wake = datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc)
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+
+    def test_wake_time_capped_at_day_boundary(self, customer):
+        # Record ends at 3pm today — after the 2pm boundary; wake_time is capped.
+        _sleep_record(
+            customer,
+            start=datetime.combine(TODAY, time(13)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(15)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        boundary = datetime.combine(TODAY, time(14)).replace(tzinfo=timezone.utc)
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == boundary
+
+    def test_wake_time_is_latest_record_end(self, customer):
+        # Two records: first ends at 2am, second at 7am; wake_time = 7am.
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(2)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        _sleep_record(
+            customer,
+            start=datetime.combine(TODAY, time(2, 30)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        expected_wake = datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc)
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+
+
+# ---------------------------------------------------------------------------
+# ensure_ranks
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRanks:
+    def test_creates_one_row_per_source(self, customer):
+        ensure_ranks(customer)
+        ranks = list(
+            DataSourceRanking.objects.filter(customer=customer).order_by("rank")
+        )
+        assert len(ranks) == len(DataSource.values)
+        assert [r.dataSource for r in ranks] == DataSource.values
+        assert [r.rank for r in ranks] == list(range(1, len(DataSource.values) + 1))
+
+    def test_idempotent(self, customer):
+        ensure_ranks(customer)
+        ensure_ranks(customer)
+        assert DataSourceRanking.objects.filter(customer=customer).count() == len(DataSource.values)
+
+    def test_rebuilds_invalid_ranks(self, customer):
+        DataSourceRanking.objects.create(customer=customer, dataSource=DataSource.APPLE_HEALTH, rank=99)
+        ensure_ranks(customer)
+        ranks = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+        assert len(ranks) == len(DataSource.values)
+        assert [r.rank for r in ranks] == list(range(1, len(DataSource.values) + 1))
+
+    def test_preferred_source_ranked_first(self, customer):
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.FITBIT,
+            device_brand="fitbit",
+            status="active",
+        )
+        ensure_ranks(customer)
+        first = DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        assert first is not None
+        assert first.dataSource == DataSource.FITBIT
+
+
+# ---------------------------------------------------------------------------
+# get_activity_by_day / get_activity_records — skipped (requires PostgreSQL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(reason="requires PostgreSQL; tested via consuming project")
 class TestActivityByDay:
     def test_empty_returns_none(self, customer):
         result = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY)
@@ -362,3 +474,57 @@ class TestActivityByDay:
         result = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, TODAY, end)
         assert set(result.keys()) == {TODAY, TODAY + timedelta(days=1), TODAY + timedelta(days=2)}
         assert all(v is None for v in result.values())
+
+    def test_get_activity_records_empty(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+        result = get_activity_records(customer, ActivityMetric.ACTIVE_CALORIES, start_dt, end_dt)
+        assert result == []
+
+    def test_get_activity_records_single(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(minutes=15)
+        ensure_ranks(customer)
+        Record.objects.create(
+            customer=customer,
+            startDate=start_dt,
+            endDate=end_dt,
+            type=ActivityMetric.ACTIVE_CALORIES.value,
+            value="300",
+            unit="kcal",
+            source=DataSource.APPLE_HEALTH,
+            sourceName="apple",
+            creationDate=NOW,
+            admin_create_date=NOW,
+        )
+        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+        result = get_activity_records(
+            customer, ActivityMetric.ACTIVE_CALORIES, start_dt, window_end, resolution_minutes=15
+        )
+        assert len(result) == 1
+        assert result[0][0] == start_dt
+        assert result[0][1] == end_dt
+        assert result[0][2] == pytest.approx(300.0)
+
+    def test_get_activity_records_daily_resolution(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        ensure_ranks(customer)
+        Record.objects.create(
+            customer=customer,
+            startDate=start_dt,
+            endDate=end_dt,
+            type=ActivityMetric.ACTIVE_CALORIES.value,
+            value="500",
+            unit="kcal",
+            source=DataSource.APPLE_HEALTH,
+            sourceName="apple",
+            creationDate=NOW,
+            admin_create_date=NOW,
+        )
+        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+        result = get_activity_records(
+            customer, ActivityMetric.ACTIVE_CALORIES, start_dt, window_end, resolution_minutes=1440
+        )
+        assert len(result) == 1
+        assert result[0][2] == pytest.approx(500.0)

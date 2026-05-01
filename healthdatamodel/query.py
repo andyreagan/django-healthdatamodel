@@ -6,27 +6,39 @@ functions here to remain insulated from internal storage changes.
 
 Sleep
 -----
-- :func:`get_sleep_hours_by_day`
+- :func:`get_sleep_hours_by_day` — total hours per day (simple form)
+- :func:`get_sleep_by_day`       — hours *and* wake time per day
 
 Activity
 --------
-- :func:`get_activity_by_day`
+- :func:`get_activity_records`  — source-ranked records at any resolution
+- :func:`get_activity_by_day`   — daily totals (convenience wrapper)
 
-Both return ``dict[date, float | None]`` keyed by every day in the requested
-range:
+The sleep functions return values keyed by every day in the requested range:
 
-* ``None``  — no records found for that day (device not worn / data not synced)
+* ``None``  — no records found (device not worn / data not synced)
 * ``0.0``   — records exist but the computed value is zero
-* float     — the computed daily value
+* float     — computed value
 
-The activity query requires PostgreSQL (it uses window-function CTEs for
-source-ranked deduplication).  Sleep works with any Django-supported backend.
+:func:`get_sleep_by_day` additionally carries the wake time (end of the last
+sleep interval, capped at the day boundary, not rounded).
+
+:func:`get_activity_records` and :func:`get_activity_by_day` require
+PostgreSQL (window-function CTEs for source-ranked deduplication).
+Sleep functions work with any Django-supported backend.
+
+Ranking
+-------
+- :func:`ensure_ranks` — ensure one
+  :class:`~healthdatamodel.models.DataSourceRanking` row exists per data
+  source for a customer; called automatically by the activity functions.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Any, NamedTuple
 
 from django.db import connection
 from django.db.models import Case, F, FloatField, IntegerField, Q, Value, When, Window
@@ -39,11 +51,28 @@ from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
 _DEFAULT_SLEEP_DEVICE_SORT_ORDER = ["oura", "whoop", "apple", "garmin"]
 
 
+class DailySleep(NamedTuple):
+    """Sleep result for a single calendar day.
+
+    Attributes
+    ----------
+    hours:
+        Total hours of sleep within the day window (``None`` if no records).
+    wake_time:
+        End of the last sleep interval, capped at the day boundary.
+        ``None`` when ``hours`` is ``None``.  Not rounded — apply
+        ``round_up_15`` or similar in the caller if needed.
+    """
+
+    hours: float | None
+    wake_time: datetime | None
+
+
 class SleepValue(StrEnum):
-    """HKCategoryValueSleepAnalysis* strings used as Record.value for sleep intervals.
+    """HKCategoryValueSleepAnalysis* strings used as ``Record.value`` for sleep.
 
     Use these on both the insert and query side so the strings stay in sync.
-    ``ASLEEP_*`` variants are counted as sleep; ``AWAKE`` and ``IN_BED`` are not.
+    ``ASLEEP_*`` variants count as sleep; ``AWAKE`` and ``IN_BED`` do not.
     """
 
     ASLEEP_UNSPECIFIED = "HKCategoryValueSleepAnalysisAsleepUnspecified"
@@ -61,7 +90,7 @@ _SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
 
 
 class ActivityMetric(StrEnum):
-    """HK type strings used as Record.type for activity metrics.
+    """HK type strings used as ``Record.type`` for activity metrics.
 
     Use these on both the insert and query side so the strings stay in sync.
     """
@@ -104,7 +133,7 @@ def _preferred_sleep_brand(customer: Any) -> str:
     return conn.device_brand if conn else ""
 
 
-def _sleep_hours_for_day(customer: Any, day: date, boundary_hour: int) -> float | None:
+def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
     start_time, end_time = _day_window(day, boundary_hour)
 
     sleep_qs = Record.objects.filter(
@@ -119,7 +148,7 @@ def _sleep_hours_for_day(customer: Any, day: date, boundary_hour: int) -> float 
 
     most_recent = sleep_qs.order_by("admin_create_date").last()
     if most_recent is None:
-        return None
+        return DailySleep(hours=None, wake_time=None)
 
     upload_dt = most_recent.admin_create_date
     devices = list(
@@ -148,7 +177,8 @@ def _sleep_hours_for_day(customer: Any, day: date, boundary_hour: int) -> float 
         )
         // 60
     )
-    return minutes / 60.0
+    wake_time = min(max(end for _, end in pairs), end_time)
+    return DailySleep(hours=minutes / 60.0, wake_time=wake_time)
 
 
 def _active_data_source(customer: Any) -> str:
@@ -160,8 +190,20 @@ def _active_data_source(customer: Any) -> str:
     return conn.data_source if conn else ""
 
 
-def _ensure_ranks(customer: Any) -> None:
-    """Ensure one DataSourceRanking row per DataSource value exists for *customer*."""
+# ---------------------------------------------------------------------------
+# Public API — ranking
+# ---------------------------------------------------------------------------
+
+
+def ensure_ranks(customer: Any) -> None:
+    """Ensure one :class:`~healthdatamodel.models.DataSourceRanking` row per
+    :class:`~healthdatamodel.constants.DataSource` value exists for *customer*.
+
+    If the ranks are already valid (correct count, correct sources, ranks
+    ``1..N`` in order) this is a no-op.  Otherwise all existing rows are
+    deleted and rebuilt, placing the customer's currently-active data source
+    first.
+    """
     n_sources = len(DataSource.values)
     existing = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
     valid = (
@@ -189,20 +231,131 @@ def _ensure_ranks(customer: Any) -> None:
     )
 
 
-def _get_daily_totals(
+# ---------------------------------------------------------------------------
+# Public API — sleep
+# ---------------------------------------------------------------------------
+
+
+def get_sleep_by_day(
     customer: Any,
-    record_type: str,
     start: date,
     end: date,
-) -> dict[date, float]:
+    day_boundary_hour: int = 14,
+) -> dict[date, DailySleep]:
     """
-    Return ``{date: sum_of_values}`` for daily-resolution records using
-    source-ranked deduplication.  Requires PostgreSQL.
-    """
-    _ensure_ranks(customer)
+    Return sleep hours and wake time for each day in ``[start, end]`` inclusive.
 
-    start_dt = datetime.combine(start, time(0)).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(end + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+    The sleep window for each calendar day runs from
+    ``(day_boundary_hour - 24h)`` to ``day_boundary_hour`` UTC.
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    start:
+        First day of the range (inclusive).
+    end:
+        Last day of the range (inclusive).
+    day_boundary_hour:
+        UTC hour that marks the end of each sleep day (default 14 → 2 pm).
+
+    Returns
+    -------
+    dict[date, DailySleep]
+        Each value is a :class:`DailySleep` named tuple:
+
+        * ``hours`` — sleep hours (``None`` if no records, ``0.0`` if zero)
+        * ``wake_time`` — end of last sleep interval capped at day boundary,
+          or ``None`` if no records.  Not rounded.
+    """
+    return {
+        start + timedelta(days=i): _sleep_for_day(
+            customer, start + timedelta(days=i), day_boundary_hour
+        )
+        for i in range((end - start).days + 1)
+    }
+
+
+def get_sleep_hours_by_day(
+    customer: Any,
+    start: date,
+    end: date,
+    day_boundary_hour: int = 14,
+) -> dict[date, float | None]:
+    """
+    Return sleep hours for each day in ``[start, end]`` inclusive.
+
+    Convenience wrapper around :func:`get_sleep_by_day` that drops the wake
+    time.  Use :func:`get_sleep_by_day` directly when the wake time is needed.
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    start:
+        First day of the range (inclusive).
+    end:
+        Last day of the range (inclusive).
+    day_boundary_hour:
+        UTC hour that marks the end of each sleep day (default 14 → 2 pm).
+
+    Returns
+    -------
+    dict[date, float | None]
+        * ``None``  — no sleep records found for that night window
+        * ``0.0``   — records found but they cover zero minutes of sleep
+        * float     — sleep hours (e.g. ``7.5`` for 7 h 30 m)
+    """
+    return {day: result.hours for day, result in get_sleep_by_day(customer, start, end, day_boundary_hour).items()}
+
+
+# ---------------------------------------------------------------------------
+# Public API — activity
+# ---------------------------------------------------------------------------
+
+
+def get_activity_records(
+    customer: Any,
+    metric: ActivityMetric,
+    start: datetime,
+    end: datetime,
+    resolution_minutes: int = 15,
+) -> list[tuple[datetime, datetime, float]]:
+    """
+    Return source-ranked deduplicated activity records at *resolution_minutes*.
+
+    Each element is ``(startDate, endDate, value)``, ordered by ``startDate``.
+    Only intervals where a record exists are returned — gaps are **not**
+    filled.  The caller is responsible for gap-filling if a complete time
+    series is required.
+
+    Rankings are initialised automatically via :func:`ensure_ranks` if not
+    already present.
+
+    .. note::
+        This function requires PostgreSQL.
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    metric:
+        Which health metric to query (see :class:`ActivityMetric`).
+    start:
+        Inclusive start of the query window (datetime, UTC).
+    end:
+        Exclusive end of the query window (datetime, UTC).
+    resolution_minutes:
+        Duration of each record in minutes (default 15).  Use 1440 for
+        daily records.
+
+    Returns
+    -------
+    list[tuple[datetime, datetime, float]]
+        ``(startDate, endDate, value)`` tuples, sorted ascending by start.
+        Values are in kcal for calorie metrics and count for steps.
+    """
+    ensure_ranks(customer)
 
     sql, params = (
         Record.objects.annotate(
@@ -234,11 +387,11 @@ def _get_daily_totals(
         )
         .filter(
             Q(source=F("source_source")),
-            Q(resolution=1440 * 60),
+            Q(resolution=resolution_minutes * 60),
             Q(customer=customer),
-            Q(startDate__gte=start_dt),
-            Q(endDate__lte=end_dt),
-            Q(type=record_type),
+            Q(startDate__gte=start),
+            Q(endDate__lte=end),
+            Q(type=metric.value),
         )
         .values("startDate", "endDate", "value_nonneg", "source_rank_rank", "source_update_rank")
         .query.sql_with_params()
@@ -248,66 +401,17 @@ def _get_daily_totals(
         cursor.execute(
             """WITH ranked AS ({})
 SELECT
-    DATE(r."startDate") AS day,
-    SUM(r."value_nonneg") AS total
+    r."startDate",
+    r."endDate",
+    r."value_nonneg"
 FROM ranked r
 WHERE r."source_rank_rank" = %s AND r."source_update_rank" = %s
-GROUP BY DATE(r."startDate")""".format(sql),
+ORDER BY r."startDate" """.format(sql),
             [*params, 1, 1],
         )
         rows = cursor.fetchall()
 
-    return {row[0]: float(row[1]) for row in rows}
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
-def get_sleep_hours_by_day(
-    customer: Any,
-    start: date,
-    end: date,
-    day_boundary_hour: int = 14,
-) -> dict[date, float | None]:
-    """
-    Return sleep hours for each day in ``[start, end]`` inclusive.
-
-    The sleep window for each calendar day runs from
-    ``(day_boundary_hour - 24h)`` to ``day_boundary_hour`` UTC.
-    The default boundary of 14 (2 pm) means the window is
-    2 pm the previous calendar day → 2 pm the current calendar day.
-
-    Device preference is read from :class:`~healthdatamodel.models.WearableConnection`.
-    When a customer has multiple simultaneous sleep-data sources, the record
-    set from the customer's preferred-sleep device (or the highest-priority
-    device in the default order oura → whoop → apple → garmin) is used.
-
-    Parameters
-    ----------
-    customer:
-        Any ``settings.AUTH_USER_MODEL`` instance.
-    start:
-        First day of the range (inclusive).
-    end:
-        Last day of the range (inclusive).
-    day_boundary_hour:
-        UTC hour that marks the end of each sleep day (default 14 → 2 pm).
-
-    Returns
-    -------
-    dict[date, float | None]
-        * ``None``  — no sleep records found for that night window
-        * ``0.0``   — records found but they cover zero minutes of sleep
-        * float     — sleep hours (e.g. ``7.5`` for 7 h 30 m)
-    """
-    return {
-        start + timedelta(days=i): _sleep_hours_for_day(
-            customer, start + timedelta(days=i), day_boundary_hour
-        )
-        for i in range((end - start).days + 1)
-    }
+    return [(row[0], row[1], float(row[2])) for row in rows]
 
 
 def get_activity_by_day(
@@ -322,6 +426,8 @@ def get_activity_by_day(
     Uses source-ranked deduplication: when a customer has records from more
     than one data source for the same day, only the highest-ranked source is
     counted.  Rankings are initialised automatically if not already present.
+
+    Delegates to :func:`get_activity_records` with ``resolution_minutes=1440``.
 
     .. note::
         This function requires PostgreSQL.
@@ -344,6 +450,14 @@ def get_activity_by_day(
         * ``0.0``   — records exist but the daily total is zero
         * float     — daily total (kcal for calorie metrics, count for steps)
     """
-    raw = _get_daily_totals(customer, metric.value, start, end)
+    start_dt = datetime.combine(start, time(0)).replace(tzinfo=timezone.utc)
+    end_dt = datetime.combine(end + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+
+    records = get_activity_records(customer, metric, start_dt, end_dt, resolution_minutes=1440)
+
+    raw: dict[date, float] = defaultdict(float)
+    for start_ts, _end_ts, value in records:
+        raw[start_ts.date()] += value
+
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     return {day: raw.get(day) for day in days}
