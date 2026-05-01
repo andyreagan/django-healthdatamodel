@@ -1,0 +1,21 @@
+[project]
+name = "healthdatamodel"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "django",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-django",
+    "pytest-freezer",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
