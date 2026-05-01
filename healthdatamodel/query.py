@@ -27,11 +27,14 @@ sleep interval, capped at the day boundary, not rounded).
 PostgreSQL (window-function CTEs for source-ranked deduplication).
 Sleep functions work with any Django-supported backend.
 
-Ranking
--------
+Ranking / source utilities
+--------------------------
 - :func:`ensure_ranks` — ensure one
   :class:`~healthdatamodel.models.DataSourceRanking` row exists per data
   source for a customer; called automatically by the activity functions.
+- :func:`has_competing_sources` — check whether records from other sources
+  exist in a window; useful on the ingest path to decide whether
+  source-ranked deduplication is needed.
 """
 from __future__ import annotations
 
@@ -191,8 +194,43 @@ def _active_data_source(customer: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public API — ranking
+# Public API — ranking / source utilities
 # ---------------------------------------------------------------------------
+
+
+def has_competing_sources(
+    customer: Any,
+    source: str,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """Return ``True`` if records from any source *other than* ``source`` exist
+    for *customer* in the window ``[start, end)``.
+
+    Useful on the ingest path: after bulk-inserting records from one source,
+    call this to decide whether source-ranked deduplication is needed before
+    computing derived stats.  If it returns ``False``, the just-inserted
+    in-memory records can be used directly.
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    source:
+        The data source whose records were just inserted (e.g.
+        ``DataSource.APPLE_HEALTH``).  Records matching this source are
+        excluded from the check.
+    start:
+        Inclusive window start (datetime, UTC).
+    end:
+        Exclusive window end (datetime, UTC).
+    """
+    return Record.objects.filter(
+        ~Q(source=source),
+        customer=customer,
+        startDate__gte=start,
+        endDate__lte=end,
+    ).exists()
 
 
 def ensure_ranks(customer: Any) -> None:

@@ -24,6 +24,7 @@ from healthdatamodel.query import (
     get_activity_records,
     get_sleep_by_day,
     get_sleep_hours_by_day,
+    has_competing_sources,
 )
 
 User = get_user_model()
@@ -396,6 +397,45 @@ class TestSleepByDay:
 # ---------------------------------------------------------------------------
 # ensure_ranks
 # ---------------------------------------------------------------------------
+
+
+class TestHasCompetingSources:
+    def test_no_records_returns_false(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is False
+
+    def test_same_source_only_returns_false(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        Record.objects.create(
+            customer=customer,
+            startDate=start_dt,
+            endDate=end_dt,
+            type=ActivityMetric.ACTIVE_CALORIES.value,
+            value="300",
+            source=DataSource.APPLE_HEALTH,
+            sourceName="apple",
+            creationDate=NOW,
+            admin_create_date=NOW,
+        )
+        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is False
+
+    def test_different_source_returns_true(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        Record.objects.create(
+            customer=customer,
+            startDate=start_dt,
+            endDate=end_dt,
+            type=ActivityMetric.ACTIVE_CALORIES.value,
+            value="300",
+            source=DataSource.FITBIT,
+            sourceName="fitbit",
+            creationDate=NOW,
+            admin_create_date=NOW,
+        )
+        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is True
 
 
 class TestEnsureRanks:
