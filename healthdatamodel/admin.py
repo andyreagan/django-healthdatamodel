@@ -168,7 +168,7 @@ class RecordAdmin(ReadonlyMixin):
 
 class DataSourceRankingAdmin(admin.ModelAdmin, ExportCsvMixin):
     list_display = ("customer", "dataSource", "rank")
-    search_fields = ("customer__email",)
+    search_fields = ["customer__email"]
     search_help_text = "Search by customer email"
     list_filter = ("dataSource",)
     ordering = ("customer", "rank")
@@ -202,11 +202,11 @@ class WearableConnectionAdmin(admin.ModelAdmin):
         "connected_at",
         "last_synced_at",
     )
-    search_fields = (
+    search_fields = [
         "customer__email",
         "customer__first_name",
         "customer__last_name",
-    )
+    ]
     search_help_text = "Search by customer email or name"
     list_filter = ("data_source", "device_brand", "status")
     ordering = ("-connected_at",)
