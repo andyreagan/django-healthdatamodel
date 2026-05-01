@@ -182,14 +182,8 @@ class TestSleepHoursBasic:
             Record.objects.filter(customer=customer).delete()
 
     def test_record_crossing_day_boundary_clipped(self, customer):
-        # Record from 1 pm previous day to 3 pm current day crosses both
-        # boundaries.  Only the portion within the 2pm–2pm window counts:
-        # 1 pm prev → 2 pm prev = 0h (before window start)
-        # 2 pm prev → 2 pm today = 24 h (the whole window)
-        # But the record only covers 1pm prev → 3pm today,
-        # so clipped to 2pm prev → 2pm today = 24 h.
-        # Practical case: short record straddling the 2pm boundary.
-        # 1pm yesterday → 3pm today, clipped to 2pm yesterday → 2pm today = 24h.
+        # Record spans the entire window: 1pm yesterday → 3pm today.
+        # Clipped to 2pm yesterday → 2pm today = 24h.
         _sleep_record(
             customer,
             start=datetime.combine(YESTERDAY, time(13)).replace(tzinfo=timezone.utc),
@@ -198,6 +192,32 @@ class TestSleepHoursBasic:
         )
         result = get_sleep_hours_by_day(customer, TODAY, TODAY)
         assert result[TODAY] == pytest.approx(24.0)
+
+    def test_record_starts_before_window_clipped(self, customer):
+        # Record starts 1h before window start, ends 1h after window start.
+        # Clipped to window_start → record_end = 1h.
+        # (Tests the endDate-within-window OR condition.)
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(13)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(YESTERDAY, time(15)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        result = get_sleep_hours_by_day(customer, TODAY, TODAY)
+        assert result[TODAY] == pytest.approx(1.0)
+
+    def test_record_ends_after_window_clipped(self, customer):
+        # Record starts 1h before window end, ends 1h after window end.
+        # Clipped to record_start → window_end = 1h.
+        # (Tests the startDate-within-window OR condition with end clipping.)
+        _sleep_record(
+            customer,
+            start=datetime.combine(TODAY, time(13)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(15)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+        )
+        result = get_sleep_hours_by_day(customer, TODAY, TODAY)
+        assert result[TODAY] == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
