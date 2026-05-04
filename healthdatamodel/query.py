@@ -499,3 +499,58 @@ def get_activity_by_day(
 
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     return {day: raw.get(day) for day in days}
+
+
+def get_activity_by_day_from_records(
+    records: list[Any],
+    metric: ActivityMetric,
+    start: date,
+    end: date,
+) -> dict[date, float | None]:
+    """Return daily activity totals aggregated from in-memory *records*.
+
+    Equivalent to :func:`get_activity_by_day` but operates on a list of
+    :class:`~healthdatamodel.schemas.RecordInput` objects already in memory,
+    avoiding a database round-trip.
+
+    Designed for the fast path after single-source ingest when
+    ``has_competing_sources`` would return ``False``.  If multiple sources are
+    present, values are summed without source-ranking deduplication, which may
+    over-count; use the database query path in that case.
+
+    Parameters
+    ----------
+    records:
+        List of :class:`~healthdatamodel.schemas.RecordInput` objects
+        (typically the return value of :func:`~healthdatamodel.ingest.expand_compact_activity`).
+    metric:
+        Which health metric to aggregate.
+    start:
+        First day of the range (inclusive).
+    end:
+        Last day of the range (inclusive).
+
+    Returns
+    -------
+    dict[date, float | None]
+        * ``None``  — no records found for that day
+        * ``0.0``   — records exist but the daily total is zero
+        * float     — daily total
+    """
+    raw: dict[date, float] = defaultdict(float)
+    for r in records:
+        if r.type != metric.value:
+            continue
+        r_date = r.startDate.date()
+        if r_date < start or r_date > end:
+            continue
+        try:
+            v = float(r.value)
+        except (ValueError, TypeError):
+            continue
+        if r.unit in ("cal", "calories"):
+            v /= 1000
+        raw[r_date] += max(0.0, v)
+
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    return {day: raw.get(day) for day in days}

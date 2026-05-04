@@ -1,9 +1,11 @@
 [project]
 name = "django-healthdatamodel"
-version = "0.2.3"
+version = "0.3.0"
 requires-python = ">=3.11"
 dependencies = [
     "django",
+    "pydantic>=2",
+    "python-dateutil",
 ]
 
 [build-system]
@@ -15,10 +17,13 @@ packages = ["healthdatamodel"]
 
 [dependency-groups]
 dev = [
+    "anyio[trio]",
     "pytest",
+    "pytest-asyncio",
     "pytest-django",
     "pytest-freezer",
 ]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
+asyncio_mode = "auto"

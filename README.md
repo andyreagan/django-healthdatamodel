@@ -141,20 +141,31 @@ else:
 
 ## Ingest API (`healthdatamodel.ingest`)
 
-The ingest module saves health data without exposing `Record` model objects to callers. There are two entry points corresponding to the two wire formats:
-
-**Full format** — individual intervals, one per record:
+The ingest module saves health data without exposing `Record` model objects to callers. Build
+`RecordInput` objects (or use the compact helpers) and pass them to the ingest functions.
 
 ```python
-from healthdatamodel.ingest import ingest_activity, aingest_activity  # async variant
+from healthdatamodel.schemas import RecordInput
+from healthdatamodel.ingest import ingest_records, aingest_records  # async variant
+from healthdatamodel.constants import DataSource
+```
 
-ingest_activity(
-    customer=customer,
-    metric=ActivityMetric.ACTIVE_CALORIES,
-    intervals=[(start1, end1, value1, source_name1), ...],
-    unit="kcal",
-    source=DataSource.APPLE_HEALTH,
-)
+**Full format** — supply `RecordInput` objects directly (Apple Health XML, Health Connect, etc.):
+
+```python
+records = [
+    RecordInput(
+        startDate=start,
+        endDate=end,
+        creationDate=created,
+        sourceName="Apple Watch",
+        value="350.5",
+        unit="kcal",
+        type=ActivityMetric.ACTIVE_CALORIES,
+    ),
+    ...
+]
+ingest_records(customer, records, source=DataSource.APPLE_HEALTH)
 ```
 
 **Compact format** — float arrays at a fixed resolution, one array per source:
@@ -175,19 +186,20 @@ ingest_compact_activity(
 )
 ```
 
-The compact version expands each source into separate `Record` rows internally; `get_activity_records` handles source-ranked deduplication at query time.
+One `Record` row is stored **per source per interval** — source-ranked deduplication happens at query time via `get_activity_records`.
 
 ### Async usage
 
-Both formats have `async` variants (`aingest_activity`, `aingest_compact_activity`) that use Django's `abulk_create`:
+Both formats have `async` variants that use Django's `abulk_create`:
 
 ```python
-await aingest_compact_activity(customer, ...)
+await aingest_records(customer, records, source=DataSource.APPLE_HEALTH)
+await aingest_compact_activity(customer, metric, start, values_by_source, ...)
 ```
 
 ### Fast path: in-memory results after ingest
 
-After inserting data from a single source, `has_competing_sources` will return `False`, meaning the query functions would return the same data you just inserted. Both ingest functions accept a `return_results=True` flag that returns the computed day-level aggregates from memory rather than re-querying the database:
+After inserting data from a single source, `has_competing_sources` will return `False`, meaning the query functions would return the same data you just inserted. `ingest_compact_activity` (and its async variant) accept a `return_results=True` flag that returns the computed day-level aggregates from memory rather than re-querying the database:
 
 ```python
 totals = ingest_compact_activity(
@@ -196,7 +208,20 @@ totals = ingest_compact_activity(
 # Returns dict[date, float | None] computed in-memory — no round-trip to DB
 ```
 
-This is equivalent to calling `get_activity_by_day` immediately after ingest when there is only one source, but without the extra query.
+This is equivalent to calling `get_activity_by_day` immediately after ingest when there is only one source. Only reliable when `has_competing_sources` would return `False`.
+
+### In-memory query
+
+`get_activity_by_day_from_records` performs the same daily aggregation as `get_activity_by_day` but operates on a list of `RecordInput` objects already in memory:
+
+```python
+from healthdatamodel.query import get_activity_by_day_from_records
+from healthdatamodel.ingest import expand_compact_activity
+
+records = expand_compact_activity(metric, start, values_by_source, resolution_minutes, unit)
+totals = get_activity_by_day_from_records(records, metric, start_date, end_date)
+# dict[date, float | None] — no database query
+```
 
 ## Admin
 
