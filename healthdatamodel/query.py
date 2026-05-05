@@ -235,19 +235,21 @@ def has_competing_sources(
 
 def ensure_ranks(customer: Any) -> None:
     """Ensure one :class:`~healthdatamodel.models.DataSourceRanking` row per
-    :class:`~healthdatamodel.constants.DataSource` value exists for *customer*.
+    :class:`~healthdatamodel.constants.DataSource` value exists for *customer*,
+    with the customer's active data source ranked first.
 
-    If the ranks are already valid (correct count, correct sources, ranks
-    ``1..N`` in order) this is a no-op.  Otherwise all existing rows are
-    deleted and rebuilt, placing the customer's currently-active data source
-    first.
+    Considers ranks valid only when: correct count, correct sources, ranks
+    ``1..N`` in order, *and* the preferred source is already first.  Otherwise
+    all existing rows are deleted and rebuilt.
     """
     n_sources = len(DataSource.values)
     existing = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+    preferred = _active_data_source(customer)
     valid = (
         len(existing) == n_sources
         and {x.dataSource for x in existing} == set(DataSource.values)
         and [x.rank for x in existing] == list(range(1, n_sources + 1))
+        and (not preferred or existing[0].dataSource == preferred)
     )
     if valid:
         return
@@ -255,7 +257,6 @@ def ensure_ranks(customer: Any) -> None:
     if existing:
         DataSourceRanking.objects.filter(customer=customer).delete()
 
-    preferred = _active_data_source(customer)
     order: list[str] = list(DataSource.values)
     if preferred and preferred in order:
         order.remove(preferred)

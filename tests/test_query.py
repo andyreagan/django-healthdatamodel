@@ -472,6 +472,21 @@ class TestEnsureRanks:
         assert first is not None
         assert first.dataSource == DataSource.FITBIT
 
+    def test_rebuilds_when_preferred_source_changes(self, customer):
+        # Ranks valid with default order (no preferred source)
+        ensure_ranks(customer)
+        # Now the customer connects fitbit — structurally ranks are still valid
+        # but fitbit should now be first
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.FITBIT,
+            device_brand="fitbit",
+            status="active",
+        )
+        ensure_ranks(customer)
+        ranks = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+        assert ranks[0].dataSource == DataSource.FITBIT
+
 
 # ---------------------------------------------------------------------------
 # get_activity_by_day / get_activity_records — skipped (requires PostgreSQL)
