@@ -1,5 +1,8 @@
 # django-healthdatamodel
 
+[![PyPI](https://img.shields.io/pypi/v/django-healthdatamodel.svg)](https://pypi.org/project/django-healthdatamodel/)
+[![Tests](https://github.com/andyreagan/django-healthdatamodel/actions/workflows/test.yml/badge.svg)](https://github.com/andyreagan/django-healthdatamodel/actions/workflows/test.yml)
+
 A reusable Django app for storing and querying health data in a schema inspired by [Apple HealthKit](https://developer.apple.com/documentation/healthkit).
 
 ## Models
