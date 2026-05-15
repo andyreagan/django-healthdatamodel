@@ -16,13 +16,15 @@ from healthdatamodel.constants import DataSource
 from healthdatamodel.ingest import (
     aingest_compact_activity,
     aingest_records,
+    aingest_workouts,
     expand_compact_activity,
     ingest_compact_activity,
     ingest_records,
+    ingest_workouts,
 )
-from healthdatamodel.models import Record
+from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric, get_activity_by_day_from_records
-from healthdatamodel.schemas import RecordInput
+from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
 
 User = get_user_model()
 
@@ -374,3 +376,132 @@ class TestAsyncIngest:
         assert result is not None
         assert result[MON] == pytest.approx(300.0)
         assert result[TUE] == pytest.approx(200.0)
+
+
+# ---------------------------------------------------------------------------
+# DataSource enum
+# ---------------------------------------------------------------------------
+
+
+def test_data_source_includes_google_health():
+    assert DataSource.GOOGLE_HEALTH == "google_health"
+    assert DataSource.GOOGLE_HEALTH.label == "Google Health"
+
+
+# ---------------------------------------------------------------------------
+# ingest_workouts
+# ---------------------------------------------------------------------------
+
+
+def _workout(
+    start: datetime,
+    end: datetime,
+    activity: str = "WALKING",
+    *,
+    calories: float | None = None,
+    distance_km: float | None = None,
+    metadata: list[MetadataEntry] | None = None,
+) -> WorkoutInput:
+    return WorkoutInput(
+        startDate=start,
+        endDate=end,
+        creationDate=datetime.now(timezone.utc),
+        sourceName="google",
+        durationUnit="s",
+        duration=(end - start).total_seconds(),
+        workoutActivityType=activity,
+        caloriesBurned=calories,
+        caloriesUnit="kcal" if calories is not None else None,
+        distance=distance_km,
+        distanceUnit="km" if distance_km is not None else None,
+        metadataEntry=metadata,
+    )
+
+
+class TestIngestWorkouts:
+    def test_persists_workout_columns(self, customer):
+        ingest_workouts(
+            customer,
+            [
+                _workout(
+                    WEEK_START + timedelta(hours=10),
+                    WEEK_START + timedelta(hours=10, minutes=30),
+                    activity="RUNNING",
+                )
+            ],
+            source=DataSource.GOOGLE_HEALTH,
+        )
+        workout = Workout.objects.get(customer=customer)
+        assert workout.workoutActivityType == "RUNNING"
+        assert workout.duration == 1800
+        assert workout.source == DataSource.GOOGLE_HEALTH
+        assert workout.sourceName == "google"
+
+    def test_persists_user_metadata_and_derived_calorie_distance_entries(
+        self, customer
+    ):
+        ingest_workouts(
+            customer,
+            [
+                _workout(
+                    WEEK_START,
+                    WEEK_START + timedelta(minutes=15),
+                    calories=42.5,
+                    distance_km=1.609344,
+                    metadata=[MetadataEntry(key="steps", value="2038")],
+                )
+            ],
+            source=DataSource.GOOGLE_HEALTH,
+        )
+        entries = {
+            e.key: e.value
+            for e in WorkoutMetadataEntry.objects.filter(workout__customer=customer)
+        }
+        assert entries["steps"] == "2038"
+        assert entries["caloriesBurned"] == "42.5"
+        assert entries["caloriesUnit"] == "kcal"
+        assert entries["distance"] == "1.609344"
+        assert entries["distanceUnit"] == "km"
+
+    def test_handles_minimal_workout_without_calories_or_distance(self, customer):
+        ingest_workouts(
+            customer,
+            [_workout(WEEK_START, WEEK_START + timedelta(minutes=5))],
+            source=DataSource.GOOGLE_HEALTH,
+        )
+        assert Workout.objects.count() == 1
+        assert WorkoutMetadataEntry.objects.count() == 0
+
+    def test_bulk_create_with_batch_size(self, customer):
+        workouts = [
+            _workout(
+                WEEK_START + timedelta(minutes=i), WEEK_START + timedelta(minutes=i + 1)
+            )
+            for i in range(5)
+        ]
+        ingest_workouts(
+            customer, workouts, source=DataSource.GOOGLE_HEALTH, batch_size=2
+        )
+        assert Workout.objects.filter(customer=customer).count() == 5
+
+    async def test_async_variant(self):
+        # Create the customer with the async ORM so we stay on one SQLite connection.
+        customer = await User.objects.acreate_user(username="async-workout-user")
+        await aingest_workouts(
+            customer,
+            [
+                _workout(
+                    WEEK_START,
+                    WEEK_START + timedelta(minutes=10),
+                    calories=25.0,
+                    metadata=[MetadataEntry(key="route", value="park-loop")],
+                )
+            ],
+            source=DataSource.GOOGLE_HEALTH,
+        )
+        assert await Workout.objects.acount() == 1
+        keys = {
+            key
+            async for key in WorkoutMetadataEntry.objects.values_list("key", flat=True)
+        }
+        assert {"route", "caloriesBurned", "caloriesUnit"} <= keys

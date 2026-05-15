@@ -28,9 +28,9 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from healthdatamodel.models import Record
+from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
-from healthdatamodel.schemas import RecordInput
+from healthdatamodel.schemas import RecordInput, WorkoutInput
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,127 @@ async def aingest_records(
     await Record.objects.abulk_create(
         models, batch_size=batch_size, ignore_conflicts=True
     )
+
+
+# ---------------------------------------------------------------------------
+# Public API — workout ingest
+# ---------------------------------------------------------------------------
+
+
+def _workout_metadata_entries(
+    workout: Workout, workout_input: WorkoutInput
+) -> list[WorkoutMetadataEntry]:
+    """Build metadata rows that capture caller-supplied metadata plus the
+    ``WorkoutInput`` fields that don't have first-class columns on ``Workout``
+    (caloriesBurned/Unit, distance/Unit)."""
+    entries: list[WorkoutMetadataEntry] = []
+    for entry in workout_input.metadataEntry or []:
+        entries.append(
+            WorkoutMetadataEntry(workout=workout, key=entry.key, value=entry.value)
+        )
+    if workout_input.caloriesBurned is not None:
+        entries.append(
+            WorkoutMetadataEntry(
+                workout=workout,
+                key="caloriesBurned",
+                value=str(workout_input.caloriesBurned),
+            )
+        )
+    if workout_input.caloriesUnit is not None:
+        entries.append(
+            WorkoutMetadataEntry(
+                workout=workout, key="caloriesUnit", value=workout_input.caloriesUnit
+            )
+        )
+    if workout_input.distance is not None:
+        entries.append(
+            WorkoutMetadataEntry(
+                workout=workout, key="distance", value=str(workout_input.distance)
+            )
+        )
+    if workout_input.distanceUnit is not None:
+        entries.append(
+            WorkoutMetadataEntry(
+                workout=workout, key="distanceUnit", value=workout_input.distanceUnit
+            )
+        )
+    return entries
+
+
+def _workout_to_django(
+    customer: Any,
+    workout: WorkoutInput,
+    source: str,
+) -> Workout:
+    return Workout(
+        customer=customer,
+        startDate=workout.startDate,
+        endDate=workout.endDate,
+        creationDate=workout.creationDate,
+        sourceVersion=workout.sourceVersion,
+        sourceName=workout.sourceName,
+        source=source,
+        device=workout.device,
+        durationUnit=workout.durationUnit,
+        duration=int(workout.duration),
+        workoutActivityType=workout.workoutActivityType,
+    )
+
+
+def ingest_workouts(
+    customer: Any,
+    workouts: list[WorkoutInput],
+    source: str,
+    batch_size: int = 1000,
+) -> None:
+    """Save *workouts* to the database.
+
+    Mirrors :func:`ingest_records`. Persists each ``WorkoutInput`` as one
+    ``Workout`` row plus ``WorkoutMetadataEntry`` rows for the caller-supplied
+    metadata and for the ``caloriesBurned`` / ``distance`` fields that don't
+    have first-class columns on ``Workout``.
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    workouts:
+        List of :class:`~healthdatamodel.schemas.WorkoutInput` objects to save.
+    source:
+        The data-pipeline identifier for all workouts (e.g.
+        ``DataSource.APPLE_HEALTH``).  Stored in ``Workout.source``.
+    batch_size:
+        Rows per ``INSERT`` statement when bulk-creating the metadata entries.
+
+    Notes
+    -----
+    Workouts are inserted one-at-a-time so the auto-generated primary keys are
+    available immediately for the metadata FK. Metadata entries are then
+    bulk-inserted in a single statement per ``batch_size``.
+    """
+    metadata: list[WorkoutMetadataEntry] = []
+    for workout_input in workouts:
+        workout = _workout_to_django(customer, workout_input, source)
+        workout.save()
+        metadata.extend(_workout_metadata_entries(workout, workout_input))
+    if metadata:
+        WorkoutMetadataEntry.objects.bulk_create(metadata, batch_size=batch_size)
+
+
+async def aingest_workouts(
+    customer: Any,
+    workouts: list[WorkoutInput],
+    source: str,
+    batch_size: int = 1000,
+) -> None:
+    """Async variant of :func:`ingest_workouts`."""
+    metadata: list[WorkoutMetadataEntry] = []
+    for workout_input in workouts:
+        workout = _workout_to_django(customer, workout_input, source)
+        await workout.asave()
+        metadata.extend(_workout_metadata_entries(workout, workout_input))
+    if metadata:
+        await WorkoutMetadataEntry.objects.abulk_create(metadata, batch_size=batch_size)
 
 
 # ---------------------------------------------------------------------------
